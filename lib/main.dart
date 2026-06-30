@@ -4,8 +4,17 @@ import 'package:ai_barcode_scanner/ai_barcode_scanner.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // 💡anonKey ではなく publishableKey に変更しました
+  await Supabase.initialize(
+    url: 'https://zirenbcrweatlsweeakb.supabase.co',
+    publishableKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InppcmVuYmNyd2VhdGxzd2VlYWtiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI3MzIyNzEsImV4cCI6MjA5ODMwODI3MX0.XQ2t1_RCZ96lDq8NRfsLrDgPq0IQ7MVjr1d_I_ZBDiY',
+  );
+
   runApp(const MyApp());
 }
 
@@ -116,20 +125,72 @@ class _BookScanPageState extends State<BookScanPage> with SingleTickerProviderSt
     super.dispose();
   }
 
-  Future<void> _loadBookshelves() async {
-    final prefs = await SharedPreferences.getInstance();
-    final String? bookshelvesString = prefs.getString('bookshelves_data_v2');
-    if (bookshelvesString != null) {
-      final List<dynamic> decodedData = json.decode(bookshelvesString);
+Future<void> _loadBookshelves() async {
+    try {
+      final List<dynamic> shelvesData = await Supabase.instance.client.from('shelves').select();
+      final List<dynamic> booksData = await Supabase.instance.client.from('books').select();
+
+      List<Map<String, dynamic>> tempBookshelves = [
+        {'name': '全般', 'books': <Map<String, dynamic>>[]}
+      ];
+
+      for (var shelf in shelvesData) {
+        final name = shelf['name'] as String;
+        if (name != '全般') {
+          tempBookshelves.add({'name': name, 'books': <Map<String, dynamic>>[]});
+        }
+      }
+
+      // クラウドから取得した本の仕分け
+      for (var bookRow in booksData) {
+        final targetShelfName = bookRow['shelf_name'] ?? '全般';
+        int targetIndex = tempBookshelves.indexWhere((s) => s['name'] == targetShelfName);
+        if (targetIndex == -1) targetIndex = 0;
+
+        final currentShelfBooks = tempBookshelves[targetIndex]['books'] as List<Map<String, dynamic>>;
+
+        final seriesName = bookRow['series_name'];
+        final volumeNumber = bookRow['volume_number'];
+
+        if (seriesName != null && seriesName.toString().isNotEmpty) {
+          // 💡 シリーズ本の場合：すでに同じシリーズが本棚にあるか探す
+          int existingSeriesIndex = currentShelfBooks.indexWhere((b) => b['series'] == seriesName);
+
+          if (existingSeriesIndex != -1) {
+            // すでにシリーズがあれば、巻数を追加
+            final List<dynamic> volumes = currentShelfBooks[existingSeriesIndex]['volumes'];
+            if (volumeNumber != null && !volumes.contains(volumeNumber)) {
+              volumes.add(volumeNumber);
+              // 巻数を数字順に並び替え
+              volumes.sort((a, b) {
+                final numA = int.tryParse(a.toString().replaceAll(RegExp(r'\D'), '')) ?? 0;
+                final numB = int.tryParse(b.toString().replaceAll(RegExp(r'\D'), '')) ?? 0;
+                return numA.compareTo(numB);
+              });
+            }
+          } else {
+            // 新規シリーズとして本棚に追加
+            currentShelfBooks.add({
+              'series': seriesName,
+              'author': bookRow['author'] ?? '著者不明',
+              'volumes': volumeNumber != null ? [volumeNumber] : [],
+            });
+          }
+        } else {
+          // 💡 通常の本の場合
+          currentShelfBooks.add({
+            'title': bookRow['title'] ?? 'タイトル不明',
+            'author': bookRow['author'] ?? '著者不明',
+            'isbn': bookRow['image_url'] ?? '',
+          });
+        }
+      }
+
       setState(() {
-        _bookshelves = decodedData.map((shelf) {
-          final List<dynamic> booksList = shelf['books'] ?? [];
-          return {
-            'name': shelf['name'] as String,
-            'books': booksList.map((b) => Map<String, dynamic>.from(b)).toList(),
-          };
-        }).toList();
+        _bookshelves = tempBookshelves;
       });
+    } catch (e) {
+      print('Supabaseからの読み込みエラー: $e');
     }
   }
 
@@ -281,19 +342,29 @@ class _BookScanPageState extends State<BookScanPage> with SingleTickerProviderSt
     );
   }
 
-  void _createNewShelf() {
+void _createNewShelf() async { // 💡 async を追加
     final name = _newShelfController.text.trim();
     if (name.isEmpty) return;
 
-    setState(() {
-      _bookshelves.add({
+    // 🔥 Supabase（クラウド）に新しい本棚の名前を保存
+    try {
+      await Supabase.instance.client.from('shelves').insert({
         'name': name,
-        'books': <Map<String, dynamic>>[],
       });
-      _selectedShelfIndex = _bookshelves.length - 1;
-      _newShelfController.clear();
-    });
-    _saveBookshelvesToDevice();
+      
+      // 保存が成功したら、アプリの画面も更新して本棚を増やす
+      setState(() {
+        _bookshelves.add({
+          'name': name,
+          'books': <Map<String, dynamic>>[],
+        });
+        _selectedShelfIndex = _bookshelves.length - 1;
+        _newShelfController.clear();
+      });
+    } catch (e) {
+      print('本棚の作成エラー: $e');
+    }
+
     if (mounted) Navigator.of(context).pop();
   }
 
@@ -634,16 +705,21 @@ class _BookScanPageState extends State<BookScanPage> with SingleTickerProviderSt
     );
   }
 
-  void _executeBulkSeriesSave(String seriesName) {
+void _executeBulkSeriesSave(String seriesName) async { // 💡 async を追加
+    final currentShelfName = _bookshelves[_selectedShelfIndex]['name'] as String;
+    String defaultAuthor = _bulkResultList.isNotEmpty ? _bulkResultList.first.author : '著者不明';
+    
+    // 一括登録する本を一時的にキープ
+    final List<BulkBookData> localBulkList = List.from(_bulkResultList);
+
     setState(() {
       final currentShelfBooks = _bookshelves[_selectedShelfIndex]['books'] as List<Map<String, dynamic>>;
-      String defaultAuthor = _bulkResultList.isNotEmpty ? _bulkResultList.first.author : '著者不明';
 
       int existingIndex = currentShelfBooks.indexWhere((book) => book['series'] == seriesName);
 
       if (existingIndex != -1) {
         final List<dynamic> volumes = currentShelfBooks[existingIndex]['volumes'];
-        for (var book in _bulkResultList) {
+        for (var book in localBulkList) {
           final volText = book.volumeController.text.trim();
           if (volText.isNotEmpty && !volumes.contains(volText)) {
             volumes.add(volText);
@@ -656,7 +732,7 @@ class _BookScanPageState extends State<BookScanPage> with SingleTickerProviderSt
         });
       } else {
         List<String> initialVolumes = [];
-        for (var book in _bulkResultList) {
+        for (var book in localBulkList) {
           final volText = book.volumeController.text.trim();
           if (volText.isNotEmpty && !initialVolumes.contains(volText)) {
             initialVolumes.add(volText);
@@ -676,14 +752,30 @@ class _BookScanPageState extends State<BookScanPage> with SingleTickerProviderSt
       }
 
       _clearBulkState();
-      final shelfName = _bookshelves[_selectedShelfIndex]['name'];
       
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('シリーズ「$seriesName」として、「$shelfName」本棚へ一括登録しました！')),
+          SnackBar(content: Text('シリーズ「$seriesName」として一括登録しました！')),
         );
       }
     });
+
+    // 🔥 一括登録した本を、1冊ずつSupabaseへ送信
+    try {
+      for (var book in localBulkList) {
+        final volText = book.volumeController.text.trim();
+        await Supabase.instance.client.from('books').insert({
+          'title': '$seriesName $volText',
+          'author': book.author.isNotEmpty ? book.author : '著者不明',
+          'image_url': book.isbn,
+          'shelf_name': currentShelfName,
+          'series_name': seriesName,
+          'volume_number': volText,
+        });
+      }
+    } catch (e) {
+      print('一括シリーズのSupabase保存エラー: $e');
+    }
 
     _saveBookshelvesToDevice();
   }
@@ -696,7 +788,9 @@ class _BookScanPageState extends State<BookScanPage> with SingleTickerProviderSt
     _bulkIsbnController.clear();
   }
 
-  void _saveSingleToBookshelf() {
+void _saveSingleToBookshelf() async {
+    final currentShelfName = _bookshelves[_selectedShelfIndex]['name'] as String;
+
     setState(() {
       final currentShelfBooks = _bookshelves[_selectedShelfIndex]['books'] as List<Map<String, dynamic>>;
       currentShelfBooks.add({
@@ -704,11 +798,26 @@ class _BookScanPageState extends State<BookScanPage> with SingleTickerProviderSt
         'author': _bookAuthors,
         'isbn': _scannedIsbn,
       });
-      _finishRegistration();
     });
+
+    // 🔥 Supabaseへデータを送信（shelf_name も一緒に送る！）
+    try {
+      await Supabase.instance.client.from('books').insert({
+        'title': _bookTitle,
+        'author': _bookAuthors,
+        'image_url': _scannedIsbn,
+        'shelf_name': currentShelfName, // 💡 どの本棚に入れたかをクラウドに記録
+      });
+    } catch (e) {
+      print('Supabaseへの保存エラー: $e');
+    }
+
+    _finishRegistration();
   }
 
-  void _saveAsSeries(String seriesName, String finalVolume) {
+void _saveAsSeries(String seriesName, String finalVolume) async { // 💡 async を追加
+    final currentShelfName = _bookshelves[_selectedShelfIndex]['name'] as String;
+
     setState(() {
       final currentShelfBooks = _bookshelves[_selectedShelfIndex]['books'] as List<Map<String, dynamic>>;
       
@@ -731,8 +840,23 @@ class _BookScanPageState extends State<BookScanPage> with SingleTickerProviderSt
           'volumes': [finalVolume],
         });
       }
-      _finishRegistration();
     });
+
+    // 🔥 Supabaseへ送信（シリーズ名と巻数を分けて保存します）
+    try {
+      await Supabase.instance.client.from('books').insert({
+        'title': '$seriesName $finalVolume', // 一覧用の仮タイトル
+        'author': _bookAuthors.isNotEmpty ? _bookAuthors : '著者不明',
+        'image_url': _scannedIsbn,
+        'shelf_name': currentShelfName,
+        'series_name': seriesName,    // 💡 シリーズ名
+        'volume_number': finalVolume, // 💡 巻数
+      });
+    } catch (e) {
+      print('シリーズのSupabase保存エラー: $e');
+    }
+
+    _finishRegistration();
   }
 
   void _finishRegistration() {

@@ -37,6 +37,7 @@ dependencies:
   ai_barcode_scanner: ^7.1.0
   shared_preferences: ^2.5.5
   http: ^1.2.0
+  supabase_flutter: ^2.15.0
 
 dev_dependencies:
   flutter_test:
